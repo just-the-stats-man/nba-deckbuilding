@@ -1,0 +1,26 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.positai
+
+# R package/project state
+renv/library/
+renv/staging/
+renv/python/
+renv/sandbox/
+
+# Quarto renders and local caches
+_site/
+/.quarto/
+*.html
+*.pdf
+
+# Large or locally regenerated datasets
+data/raw/**
+data/interim/**
+data/derived/**
+outputs/**
+!data/raw/.gitkeep
+!data/interim/.gitkeep
+!data/derived/.gitkeep

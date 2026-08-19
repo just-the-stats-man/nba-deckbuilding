@@ -1,0 +1,20 @@
+project:
+  type: website
+  output-dir: _site
+
+website:
+  title: "NBA RWE Methods Portfolio"
+  navbar:
+    left:
+      - href: index.qmd
+        text: Home
+      - href: RWE_METHODS_ROADMAP.md
+        text: Roadmap
+      - href: docs/estimand_template.md
+        text: Estimand Template
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    code-fold: true

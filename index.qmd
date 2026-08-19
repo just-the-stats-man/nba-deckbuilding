@@ -1,0 +1,25 @@
+---
+title: "NBA RWE Methods Portfolio"
+---
+
+This project uses NBA observational data as a sandbox for Real-World Evidence and biostatistics methods.
+
+The portfolio is being organized around transparent study design, explicit estimands, reproducible R workflows, and careful interpretation. The goal is not to invent a new player-ranking metric. Established basketball measures such as BPM, VORP, Win Shares, WS/48, and PER will be used where they are appropriate as outcomes, covariates, descriptive measures, or sensitivity endpoints.
+
+## First Reboot Pass
+
+This pass creates the project foundation:
+
+- RWE methodology roadmap
+- Estimand and analysis template
+- Data dictionary skeleton
+- Project principles
+- Future analysis directories
+- Quarto site skeleton
+- Next-step plan for the player-season data foundation
+
+Substantive data acquisition and statistical analyses have not started.
+
+## Legacy Work
+
+The existing CourtContext / deck-building scripts and generated data are preserved as legacy material. They may be useful later for specific methods that truly require play-by-play, lineup, stint, tracking, or possession-level data.
