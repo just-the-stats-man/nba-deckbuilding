@@ -1,0 +1,22 @@
+I replaced the previous messy R scripts with a clean explicit pipeline:
+
+- 00_config.R
+- 01_setup_project.R
+- R/helpers.R
+- 02_player_season.R
+- 03_pull_games_pbp_rotations.R
+- 04_build_stints.R
+- 05_score_stints.R
+- 99_run_pipeline.R
+
+Please review the repo for static issues only first. Do not rewrite the whole project.
+
+Tasks:
+1. Check for missing sourced files.
+2. Check for undefined functions/objects.
+3. Check for inconsistent paths.
+4. Check whether hoopR function return objects are handled safely.
+5. Make the smallest possible fixes so source("99_run_pipeline.R") can run locally.
+6. If runtime failure depends on unknown hoopR output column names, stop and add a clear diagnostic message instead of guessing.
+
+This project is an R-first NBA lineup/stint modeling pipeline for future plus-minus alternatives and card-game style player archetypes.
