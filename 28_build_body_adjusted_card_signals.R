@@ -19,6 +19,7 @@ source("01_setup_project.R")
 source("R/helpers.R")
 
 physical_attributes_path <- "outputs/player_physical_attributes.parquet"
+physical_force_profile_path <- "outputs/physical/player_physical_force_profile.parquet"
 player_card_moves_path <- "outputs/player_card_moves.parquet"
 possession_effects_refined_path <- "outputs/effects/player_possession_effects_refined.parquet"
 cards_output_dir <- "outputs/cards"
@@ -95,6 +96,73 @@ physical_attributes <- read_project_parquet(physical_attributes_path) %>%
 
 validate_columns(physical_attributes, c("player_id", "physical_attribute", "body_class", "physical_modifier"))
 
+force_profile_diagnostics <- tibble::tibble(player_id = character())
+force_profile_joined <- FALSE
+
+if (file.exists(physical_force_profile_path)) {
+  force_profile_diagnostics <- read_project_parquet(physical_force_profile_path) %>%
+    janitor::clean_names() %>%
+    convert_numeric_cols() %>%
+    add_missing_cols(c(
+      "player_id",
+      "physical_force_score",
+      "body_class_force_percentile",
+      "physical_force_tier",
+      "force_profile_confidence",
+      "force_refined_physical_modifier",
+      "force_refined_physical_attribute"
+    ), NA) %>%
+    dplyr::mutate(
+      player_id = as.character(.data$player_id),
+      physical_force_score = suppressWarnings(as.numeric(.data$physical_force_score)),
+      body_class_force_percentile = suppressWarnings(as.numeric(.data$body_class_force_percentile)),
+      physical_force_tier = as.character(.data$physical_force_tier),
+      force_profile_confidence = as.character(.data$force_profile_confidence),
+      force_refined_physical_modifier = as.character(.data$force_refined_physical_modifier),
+      force_refined_physical_attribute = as.character(.data$force_refined_physical_attribute)
+    ) %>%
+    dplyr::select(
+      "player_id",
+      "physical_force_score",
+      "body_class_force_percentile",
+      "physical_force_tier",
+      "force_profile_confidence",
+      "force_refined_physical_modifier",
+      "force_refined_physical_attribute"
+    ) %>%
+    dplyr::filter(!is.na(.data$player_id)) %>%
+    dplyr::distinct(.data$player_id, .keep_all = TRUE)
+
+  force_profile_joined <- nrow(force_profile_diagnostics) > 0
+} else {
+  message(
+    "Optional physical force profile diagnostics not found: ",
+    physical_force_profile_path,
+    ". Phase 28 will use Phase 27 physical attributes only."
+  )
+}
+
+physical_context <- physical_attributes %>%
+  dplyr::left_join(force_profile_diagnostics, by = "player_id") %>%
+  add_missing_cols(c(
+    "physical_force_score",
+    "body_class_force_percentile",
+    "physical_force_tier",
+    "force_profile_confidence",
+    "force_refined_physical_modifier",
+    "force_refined_physical_attribute"
+  ), NA) %>%
+  dplyr::mutate(
+    physical_attribute_source = "phase27_body_heuristic",
+    physical_force_score = suppressWarnings(as.numeric(.data$physical_force_score)),
+    body_class_force_percentile = suppressWarnings(as.numeric(.data$body_class_force_percentile)),
+    physical_force_tier = as.character(.data$physical_force_tier),
+    force_profile_confidence = as.character(.data$force_profile_confidence),
+    force_refined_physical_modifier = as.character(.data$force_refined_physical_modifier),
+    force_refined_physical_attribute = as.character(.data$force_refined_physical_attribute),
+    force_profile_available = !is.na(.data$physical_force_score)
+  )
+
 player_card_moves <- read_project_parquet(player_card_moves_path) %>%
   janitor::clean_names() %>%
   convert_numeric_cols() %>%
@@ -138,7 +206,7 @@ player_card_moves <- read_project_parquet(player_card_moves_path) %>%
 validate_columns(player_card_moves, c("player_id", "player_name", "move_name"))
 
 move_baselines_by_physical_attribute <- player_card_moves %>%
-  dplyr::left_join(physical_attributes, by = "player_id") %>%
+  dplyr::left_join(physical_context, by = "player_id") %>%
   dplyr::filter(!is.na(.data$physical_attribute), !is.na(.data$move_name)) %>%
   dplyr::group_by(.data$physical_attribute, .data$move_name) %>%
   dplyr::summarise(
@@ -150,7 +218,7 @@ move_baselines_by_physical_attribute <- player_card_moves %>%
   )
 
 body_adjusted_moves <- player_card_moves %>%
-  dplyr::left_join(physical_attributes, by = "player_id") %>%
+  dplyr::left_join(physical_context, by = "player_id") %>%
   dplyr::left_join(move_baselines_by_physical_attribute, by = c("physical_attribute", "move_name")) %>%
   dplyr::mutate(
     signal_domain = "offensive_move",
@@ -200,7 +268,7 @@ if (file.exists(possession_effects_refined_path)) {
     )
 
   effect_baselines_by_physical_attribute <- possession_effects_refined %>%
-    dplyr::left_join(physical_attributes, by = "player_id") %>%
+    dplyr::left_join(physical_context, by = "player_id") %>%
     dplyr::filter(
       !is.na(.data$physical_attribute),
       !is.na(.data$effect_name),
@@ -215,7 +283,7 @@ if (file.exists(possession_effects_refined_path)) {
     )
 
   body_adjusted_effects <- possession_effects_refined %>%
-    dplyr::left_join(physical_attributes, by = "player_id") %>%
+    dplyr::left_join(physical_context, by = "player_id") %>%
     dplyr::left_join(
       effect_baselines_by_physical_attribute,
       by = c("physical_attribute", "effect_type", "effect_name")
@@ -280,6 +348,14 @@ body_adjusted_card_signals <- dplyr::bind_rows(
     "physical_attribute",
     "body_class",
     "physical_modifier",
+    "physical_attribute_source",
+    "force_profile_available",
+    "physical_force_score",
+    "body_class_force_percentile",
+    "physical_force_tier",
+    "force_profile_confidence",
+    "force_refined_physical_modifier",
+    "force_refined_physical_attribute",
     "signal_name",
     "move_name",
     "move_classification",
@@ -334,10 +410,30 @@ write_project_parquet(body_adjusted_card_signals, body_adjusted_card_signals_pat
 
 message("Phase 28 body-adjusted card signal diagnostics:")
 
+message("Physical attribute source:")
+print(
+  body_adjusted_card_signals %>%
+    dplyr::distinct(.data$physical_attribute_source)
+)
+
+message("Force profile diagnostics joined: ", force_profile_joined)
+print(
+  body_adjusted_card_signals %>%
+    dplyr::distinct(.data$player_id, .data$force_profile_available) %>%
+    dplyr::count(.data$force_profile_available, sort = TRUE)
+)
+
 message("Rows by signal domain:")
 print(
   body_adjusted_card_signals %>%
     dplyr::count(.data$signal_domain, sort = TRUE)
+)
+
+message("Counts by official Phase 27 physical_attribute:")
+print(
+  body_adjusted_card_signals %>%
+    dplyr::distinct(.data$player_id, .data$physical_attribute, .data$body_class, .data$physical_modifier) %>%
+    dplyr::count(.data$physical_attribute, .data$body_class, .data$physical_modifier, sort = TRUE)
 )
 
 message("Move baseline coverage by physical_attribute:")
@@ -371,6 +467,24 @@ if (nrow(body_adjusted_effects) > 0) {
       dplyr::arrange(dplyr::desc(.data$rows))
   )
 }
+
+message("Top physical_force_score among players in output (diagnostic only):")
+print(
+  body_adjusted_card_signals %>%
+    dplyr::distinct(
+      .data$player_id,
+      .data$player_name,
+      .data$physical_attribute,
+      .data$physical_force_score,
+      .data$body_class_force_percentile,
+      .data$physical_force_tier,
+      .data$force_profile_confidence,
+      .data$force_refined_physical_attribute
+    ) %>%
+    dplyr::filter(!is.na(.data$physical_force_score)) %>%
+    dplyr::arrange(dplyr::desc(.data$physical_force_score)) %>%
+    dplyr::slice_head(n = 25)
+)
 
 message("Top positive body-adjusted offensive move contribution surplus:")
 print(
