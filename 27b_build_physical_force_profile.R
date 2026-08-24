@@ -164,6 +164,16 @@ row_weighted_mean_available <- function(component_df, weight_named_vector) {
   out
 }
 
+neutral_group_median <- function(x) {
+  out <- stats::median(safe_numeric(x), na.rm = TRUE)
+
+  if (is.na(out) || is.nan(out) || is.infinite(out)) {
+    return(50)
+  }
+
+  out
+}
+
 force_tier_from_score <- function(score) {
   dplyr::case_when(
     is.na(score) ~ "Unavailable",
@@ -175,14 +185,47 @@ force_tier_from_score <- function(score) {
   )
 }
 
-force_modifier_from_components <- function(physical_force_score, mass_component, strength_component, acceleration_speed_component, explosiveness_component) {
+force_modifier_from_components <- function(
+  phase27_body_class,
+  phase27_physical_modifier,
+  physical_force_score,
+  body_class_force_percentile,
+  mass_component,
+  strength_component_scored,
+  acceleration_speed_component_scored,
+  explosiveness_component_scored,
+  length_component,
+  force_score_heavily_imputed
+) {
   dplyr::case_when(
+    is.na(physical_force_score) & !is.na(phase27_physical_modifier) ~ phase27_physical_modifier,
     is.na(physical_force_score) ~ NA_character_,
+    phase27_physical_modifier == "Power" &
+      !force_score_heavily_imputed &
+      !is.na(body_class_force_percentile) &
+      physical_force_score <= 35 &
+      body_class_force_percentile <= 0.20 ~ "Finesse",
+    phase27_physical_modifier == "Power" ~ "Power",
     !is.na(mass_component) & mass_component >= 70 ~ "Power",
-    !is.na(strength_component) & strength_component >= 70 ~ "Power",
+    !is.na(strength_component_scored) & strength_component_scored >= 70 ~ "Power",
     !is.na(physical_force_score) & physical_force_score >= 62 ~ "Power",
-    !is.na(acceleration_speed_component) & !is.na(explosiveness_component) &
-      acceleration_speed_component >= 75 & explosiveness_component >= 75 & physical_force_score >= 55 ~ "Power",
+    !is.na(body_class_force_percentile) & body_class_force_percentile >= 0.70 ~ "Power",
+    phase27_body_class == "Big" &
+      !is.na(physical_force_score) & physical_force_score >= 52 &
+      !is.na(mass_component) & mass_component >= 55 &
+      !is.na(strength_component_scored) & strength_component_scored >= 45 ~ "Power",
+    phase27_body_class == "Big" &
+      !is.na(physical_force_score) & physical_force_score >= 50 &
+      !is.na(mass_component) & mass_component >= 45 &
+      !is.na(length_component) & length_component >= 65 ~ "Power",
+    !is.na(physical_force_score) & physical_force_score >= 55 &
+      ((!is.na(mass_component) & mass_component >= 55) |
+        (!is.na(strength_component_scored) & strength_component_scored >= 55)) ~ "Power",
+    !is.na(acceleration_speed_component_scored) & !is.na(explosiveness_component_scored) &
+      acceleration_speed_component_scored >= 75 & explosiveness_component_scored >= 75 & physical_force_score >= 55 ~ "Power",
+    !is.na(length_component) & length_component >= 85 &
+      !is.na(mass_component) & mass_component < 45 &
+      !is.na(physical_force_score) & physical_force_score < 62 ~ "Finesse",
     TRUE ~ "Finesse"
   )
 }
@@ -329,9 +372,9 @@ physical_attributes <- safe_read_parquet(physical_attributes_path) %>%
     phase27_standing_reach = safe_numeric(.data$standing_reach),
     bmi_proxy = safe_numeric(.data$bmi_proxy),
     body_class_weight_percentile = safe_numeric(.data$body_class_weight_percentile),
-    body_class = as.character(.data$body_class),
-    existing_physical_modifier = as.character(.data$physical_modifier),
-    physical_attribute = as.character(.data$physical_attribute)
+    phase27_body_class = as.character(.data$body_class),
+    phase27_physical_modifier = as.character(.data$physical_modifier),
+    phase27_physical_attribute = as.character(.data$physical_attribute)
   ) %>%
   dplyr::select(
     "player_id",
@@ -342,13 +385,13 @@ physical_attributes <- safe_read_parquet(physical_attributes_path) %>%
     "phase27_standing_reach",
     "bmi_proxy",
     "body_class_weight_percentile",
-    "body_class",
-    "existing_physical_modifier",
-    "physical_attribute"
+    "phase27_body_class",
+    "phase27_physical_modifier",
+    "phase27_physical_attribute"
   )
 
 validate_columns(physical_measurements, c("player_id", "player_name_measurement"))
-validate_columns(physical_attributes, c("player_id", "body_class", "existing_physical_modifier"))
+validate_columns(physical_attributes, c("player_id", "phase27_body_class", "phase27_physical_modifier", "phase27_physical_attribute"))
 
 tracking_candidate_paths <- c(
   "outputs/attacks/player_tracking_creation_metrics.parquet",
@@ -393,7 +436,7 @@ force_base <- physical_measurements %>%
       dplyr::if_else(!is.na(.data$height) & .data$height > 0 & !is.na(.data$weight), 703 * .data$weight / (.data$height^2), NA_real_)
     )
   ) %>%
-  dplyr::group_by(.data$body_class) %>%
+  dplyr::group_by(.data$phase27_body_class) %>%
   dplyr::mutate(
     body_class_weight_percentile = dplyr::coalesce(
       .data$body_class_weight_percentile,
@@ -449,25 +492,84 @@ force_base <- physical_measurements %>%
 
 component_weights <- c(
   mass_component = 0.30,
-  acceleration_speed_component = 0.20,
-  explosiveness_component = 0.20,
-  strength_component = 0.25,
+  acceleration_speed_component_scored = 0.20,
+  explosiveness_component_scored = 0.20,
+  strength_component_scored = 0.25,
   length_component = 0.05
 )
 
+row_weighted_force_score <- function(
+  mass_component,
+  acceleration_speed_component_scored,
+  explosiveness_component_scored,
+  strength_component_scored,
+  length_component
+) {
+  component_df <- data.frame(
+    mass_component = safe_numeric(mass_component),
+    acceleration_speed_component_scored = safe_numeric(acceleration_speed_component_scored),
+    explosiveness_component_scored = safe_numeric(explosiveness_component_scored),
+    strength_component_scored = safe_numeric(strength_component_scored),
+    length_component = safe_numeric(length_component),
+    check.names = FALSE
+  )
+
+  row_weighted_mean_available(component_df, component_weights)
+}
+
 player_physical_force_profile <- force_base %>%
+  dplyr::group_by(.data$phase27_body_class) %>%
   dplyr::mutate(
-    physical_force_score = clip_0_100(row_weighted_mean_available(
-      dplyr::select(
-        .,
-        "mass_component",
-        "acceleration_speed_component",
-        "explosiveness_component",
-        "strength_component",
-        "length_component"
-      ),
-      component_weights
+    neutral_acceleration_speed_component = neutral_group_median(.data$acceleration_speed_component),
+    neutral_explosiveness_component = neutral_group_median(.data$explosiveness_component),
+    neutral_strength_component = neutral_group_median(.data$strength_component)
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    acceleration_speed_missing = is.na(.data$acceleration_speed_component),
+    explosiveness_missing = is.na(.data$explosiveness_component),
+    strength_missing = is.na(.data$strength_component),
+    acceleration_speed_component_scored = dplyr::coalesce(
+      .data$acceleration_speed_component,
+      .data$neutral_acceleration_speed_component,
+      50
+    ),
+    explosiveness_component_scored = dplyr::coalesce(
+      .data$explosiveness_component,
+      .data$neutral_explosiveness_component,
+      50
+    ),
+    strength_component_scored = dplyr::coalesce(
+      .data$strength_component,
+      .data$neutral_strength_component,
+      50
+    ),
+    force_score_imputed_component_count = rowSums(cbind(
+      .data$acceleration_speed_missing,
+      .data$explosiveness_missing,
+      .data$strength_missing
     )),
+    force_score_heavily_imputed = .data$force_score_imputed_component_count >= 2
+  ) %>%
+  dplyr::mutate(
+    physical_force_score = clip_0_100(row_weighted_force_score(
+      .data$mass_component,
+      .data$acceleration_speed_component_scored,
+      .data$explosiveness_component_scored,
+      .data$strength_component_scored,
+      .data$length_component
+    ))
+  ) %>%
+  dplyr::group_by(.data$phase27_body_class) %>%
+  dplyr::mutate(
+    body_class_force_percentile = dplyr::if_else(
+      !is.na(.data$physical_force_score) & sum(!is.na(.data$physical_force_score)) > 1,
+      dplyr::percent_rank(.data$physical_force_score),
+      NA_real_
+    )
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
     physical_force_tier = force_tier_from_score(.data$physical_force_score),
     speed_agility_available = !is.na(.data$acceleration_speed_component),
     explosiveness_available = !is.na(.data$explosiveness_component),
@@ -482,22 +584,57 @@ player_physical_force_profile <- force_base %>%
     )),
     force_profile_confidence = dplyr::case_when(
       is.na(.data$physical_force_score) ~ "unavailable",
-      .data$force_component_count >= 5 ~ "high",
+      .data$force_component_count >= 5 & !.data$force_score_heavily_imputed ~ "high",
+      .data$force_component_count >= 4 ~ "medium",
       .data$force_component_count >= 3 & (.data$speed_agility_available | .data$explosiveness_available) ~ "medium",
       .data$force_component_count >= 2 ~ "low",
       TRUE ~ "very_low"
     ),
     force_refined_physical_modifier = force_modifier_from_components(
+      .data$phase27_body_class,
+      .data$phase27_physical_modifier,
       .data$physical_force_score,
+      .data$body_class_force_percentile,
       .data$mass_component,
-      .data$strength_component,
-      .data$acceleration_speed_component,
-      .data$explosiveness_component
+      .data$strength_component_scored,
+      .data$acceleration_speed_component_scored,
+      .data$explosiveness_component_scored,
+      .data$length_component,
+      .data$force_score_heavily_imputed
     ),
-    force_modifier_changed_from_phase27 = !is.na(.data$existing_physical_modifier) &
+    borderline_force_profile = !is.na(.data$physical_force_score) &
+      .data$force_refined_physical_modifier == "Finesse" &
+      (
+        (!is.na(.data$body_class_force_percentile) & .data$body_class_force_percentile >= 0.55) |
+          (!is.na(.data$mass_component) & .data$mass_component >= 55) |
+          (!is.na(.data$strength_component_scored) & .data$strength_component_scored >= 55) |
+          (
+            .data$phase27_body_class == "Big" &
+              !is.na(.data$physical_force_score) & .data$physical_force_score >= 45 &
+              !is.na(.data$mass_component) & .data$mass_component >= 45 &
+              !is.na(.data$length_component) & .data$length_component >= 60
+          )
+      ),
+    force_refined_physical_attribute = dplyr::if_else(
+      !is.na(.data$force_refined_physical_modifier) & !is.na(.data$phase27_body_class),
+      paste(.data$force_refined_physical_modifier, .data$phase27_body_class),
+      NA_character_
+    ),
+    force_modifier_changed_from_phase27 = !is.na(.data$phase27_physical_modifier) &
       !is.na(.data$force_refined_physical_modifier) &
-      .data$existing_physical_modifier != .data$force_refined_physical_modifier,
+      .data$phase27_physical_modifier != .data$force_refined_physical_modifier,
     force_profile_note = dplyr::case_when(
+      .data$force_score_heavily_imputed ~ paste(
+        "Physical force score uses neutral within-body-class imputation for missing athletic testing components.",
+        "Missing speed/agility, explosiveness, or direct strength data reduce confidence rather than lowering the score.",
+        "No ATK, DEF, CR, shooting, passing, role, IQ, or card stats were used.",
+        energy_movement_availability_note
+      ),
+      .data$borderline_force_profile ~ paste(
+        "Physical force profile is borderline: body/mass signals suggest some force pressure, but current evidence does not strongly override the Finesse label.",
+        "Power and Finesse are descriptive physical styles, not quality rankings.",
+        energy_movement_availability_note
+      ),
       .data$force_profile_confidence %in% c("high", "medium") ~ paste(
         "Physical force profile uses body-only mass, length, speed/agility, explosiveness, and strength proxies.",
         "Power and Finesse are descriptive physical styles, not quality rankings.",
@@ -521,20 +658,31 @@ player_physical_force_profile <- force_base %>%
     "height_wingspan_diff",
     "bmi_proxy",
     "body_class_weight_percentile",
-    "body_class",
-    "physical_attribute",
-    "existing_physical_modifier",
+    "phase27_body_class",
+    "phase27_physical_modifier",
+    "phase27_physical_attribute",
     "force_refined_physical_modifier",
+    "force_refined_physical_attribute",
     "force_modifier_changed_from_phase27",
+    "body_class_force_percentile",
     "mass_component",
     "length_component",
     "acceleration_speed_component",
+    "acceleration_speed_component_scored",
+    "acceleration_speed_missing",
     "explosiveness_component",
+    "explosiveness_component_scored",
+    "explosiveness_missing",
     "strength_component",
+    "strength_component_scored",
+    "strength_missing",
     "physical_force_score",
     "physical_force_tier",
     "force_profile_confidence",
     "force_component_count",
+    "force_score_imputed_component_count",
+    "force_score_heavily_imputed",
+    "borderline_force_profile",
     "speed_agility_available",
     "explosiveness_available",
     "strength_direct_available",
@@ -569,17 +717,27 @@ print(
     dplyr::filter(stringr::str_detect(.data$player_name, requested_player_pattern)) %>%
     dplyr::select(
       "player_name",
-      "body_class",
-      "existing_physical_modifier",
+      "phase27_body_class",
+      "phase27_physical_modifier",
       "force_refined_physical_modifier",
+      "force_refined_physical_attribute",
       "physical_force_score",
       "physical_force_tier",
+      "body_class_force_percentile",
       "mass_component",
       "acceleration_speed_component",
+      "acceleration_speed_component_scored",
+      "acceleration_speed_missing",
       "explosiveness_component",
+      "explosiveness_component_scored",
+      "explosiveness_missing",
       "strength_component",
+      "strength_component_scored",
+      "strength_missing",
       "length_component",
       "force_profile_confidence",
+      "force_score_heavily_imputed",
+      "borderline_force_profile",
       "force_modifier_changed_from_phase27"
     ) %>%
     dplyr::arrange(.data$player_name)
@@ -592,15 +750,20 @@ print(
     dplyr::arrange(dplyr::desc(.data$physical_force_score)) %>%
     dplyr::select(
       "player_name",
-      "body_class",
-      "existing_physical_modifier",
+      "phase27_body_class",
+      "phase27_physical_modifier",
       "force_refined_physical_modifier",
+      "force_refined_physical_attribute",
       "physical_force_score",
       "physical_force_tier",
+      "body_class_force_percentile",
       "mass_component",
       "strength_component",
+      "strength_component_scored",
       "acceleration_speed_component",
-      "explosiveness_component"
+      "acceleration_speed_component_scored",
+      "explosiveness_component",
+      "explosiveness_component_scored"
     ) %>%
     dplyr::slice_head(n = 25)
 )
@@ -612,15 +775,21 @@ print(
     dplyr::arrange(.data$physical_force_score) %>%
     dplyr::select(
       "player_name",
-      "body_class",
-      "existing_physical_modifier",
+      "phase27_body_class",
+      "phase27_physical_modifier",
       "force_refined_physical_modifier",
+      "force_refined_physical_attribute",
       "physical_force_score",
       "physical_force_tier",
+      "body_class_force_percentile",
       "mass_component",
       "strength_component",
+      "strength_component_scored",
       "acceleration_speed_component",
-      "explosiveness_component"
+      "acceleration_speed_component_scored",
+      "explosiveness_component",
+      "explosiveness_component_scored",
+      "force_score_heavily_imputed"
     ) %>%
     dplyr::slice_head(n = 25)
 )
@@ -632,14 +801,20 @@ print(
     dplyr::arrange(dplyr::desc(.data$physical_force_score)) %>%
     dplyr::select(
       "player_name",
-      "body_class",
-      "existing_physical_modifier",
+      "phase27_body_class",
+      "phase27_physical_modifier",
       "force_refined_physical_modifier",
+      "force_refined_physical_attribute",
       "physical_force_score",
+      "body_class_force_percentile",
       "mass_component",
       "strength_component",
+      "strength_component_scored",
       "acceleration_speed_component",
+      "acceleration_speed_component_scored",
       "explosiveness_component",
+      "explosiveness_component_scored",
+      "force_score_heavily_imputed",
       "force_profile_confidence"
     ) %>%
     dplyr::slice_head(n = 50)
@@ -655,10 +830,15 @@ print(
       modified_lane_agility_time_missing_pct = 100 * mean(is.na(.data$modified_lane_agility_time)),
       shuttle_run_missing_pct = 100 * mean(is.na(.data$shuttle_run)),
       acceleration_speed_component_missing_pct = 100 * mean(is.na(.data$acceleration_speed_component)),
+      acceleration_speed_scored_missing_pct = 100 * mean(is.na(.data$acceleration_speed_component_scored)),
       max_vertical_leap_missing_pct = 100 * mean(is.na(.data$max_vertical_leap)),
       standing_vertical_leap_missing_pct = 100 * mean(is.na(.data$standing_vertical_leap)),
       explosiveness_component_missing_pct = 100 * mean(is.na(.data$explosiveness_component)),
+      explosiveness_scored_missing_pct = 100 * mean(is.na(.data$explosiveness_component_scored)),
       bench_press_missing_pct = 100 * mean(is.na(.data$bench_press)),
+      strength_component_missing_pct = 100 * mean(is.na(.data$strength_component)),
+      strength_scored_missing_pct = 100 * mean(is.na(.data$strength_component_scored)),
+      heavily_imputed_score_pct = 100 * mean(.data$force_score_heavily_imputed, na.rm = TRUE),
       .groups = "drop"
     )
 )
