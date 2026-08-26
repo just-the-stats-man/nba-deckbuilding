@@ -20,6 +20,7 @@ source("R/helpers.R")
 
 atk_v2_path <- "outputs/player_card_ATK_v2.parquet"
 player_card_moves_path <- "outputs/player_card_moves.parquet"
+body_adjusted_move_eligibility_path <- "outputs/cards/body_adjusted_move_eligibility.parquet"
 body_adjusted_signals_path <- "outputs/cards/body_adjusted_card_signals.parquet"
 physical_attributes_path <- "outputs/player_physical_attributes.parquet"
 physical_force_profile_path <- "outputs/physical/player_physical_force_profile.parquet"
@@ -210,7 +211,98 @@ player_card_moves <- safe_read_card_parquet(player_card_moves_path) %>%
     move_card_note = as.character(.data$move_card_note)
   )
 
-eligible_moves <- player_card_moves %>%
+original_eligible_moves <- player_card_moves %>%
+  dplyr::filter(dplyr::coalesce(.data$is_card_eligible, FALSE), !is.na(.data$move_name)) %>%
+  dplyr::arrange(.data$player_id, dplyr::desc(.data$move_contribution_total), .data$move_name)
+
+original_eligible_moves_summary <- original_eligible_moves %>%
+  dplyr::group_by(.data$player_id) %>%
+  dplyr::summarise(
+    original_eligible_offensive_moves = collapse_move_rows(
+      .data$move_name,
+      .data$evidence_tier,
+      .data$move_contribution_total,
+      max_items = 8
+    ),
+    original_eligible_offensive_move_count = dplyr::n(),
+    .groups = "drop"
+  )
+
+body_adjusted_move_eligibility_available <- file.exists(body_adjusted_move_eligibility_path)
+
+if (body_adjusted_move_eligibility_available) {
+  body_adjusted_move_eligibility <- safe_read_card_parquet(body_adjusted_move_eligibility_path) %>%
+    add_missing_cols(c(
+      "player_id",
+      "player_name",
+      "move_name",
+      "original_move_classification",
+      "original_is_card_eligible",
+      "evidence_tier",
+      "move_contribution_total",
+      "body_adjusted_contribution_surplus",
+      "body_adjusted_move_eligible",
+      "body_adjusted_move_classification",
+      "body_adjusted_eligibility_reason"
+    ), NA) %>%
+    dplyr::mutate(
+      player_id = as.character(.data$player_id),
+      player_name = as.character(.data$player_name),
+      move_name = as.character(.data$move_name),
+      original_move_classification = as.character(.data$original_move_classification),
+      original_is_card_eligible = to_logical_flag(.data$original_is_card_eligible),
+      evidence_tier = as.character(.data$evidence_tier),
+      move_contribution_total = suppressWarnings(as.numeric(.data$move_contribution_total)),
+      body_adjusted_contribution_surplus = suppressWarnings(as.numeric(.data$body_adjusted_contribution_surplus)),
+      body_adjusted_move_eligible = to_logical_flag(.data$body_adjusted_move_eligible),
+      body_adjusted_move_classification = as.character(.data$body_adjusted_move_classification),
+      body_adjusted_eligibility_reason = as.character(.data$body_adjusted_eligibility_reason),
+      low_evidence_upgrade_guardrail = .data$evidence_tier %in% c("D", "F") &
+        !dplyr::coalesce(.data$original_is_card_eligible, FALSE),
+      is_card_eligible = dplyr::if_else(
+        .data$low_evidence_upgrade_guardrail,
+        FALSE,
+        dplyr::coalesce(.data$body_adjusted_move_eligible, FALSE)
+      ),
+      move_classification = dplyr::if_else(
+        .data$low_evidence_upgrade_guardrail,
+        "NOT_CARD_ELIGIBLE",
+        .data$body_adjusted_move_classification
+      ),
+      move_card_note = dplyr::if_else(
+        .data$low_evidence_upgrade_guardrail,
+        "Rejected in Phase 29 guardrail: D/F evidence moves cannot be upgraded.",
+        .data$body_adjusted_eligibility_reason
+      ),
+      move_eligibility_source = "phase32_body_adjusted_move_eligibility"
+    ) %>%
+    dplyr::select(
+      "player_id",
+      "player_name",
+      "move_name",
+      "move_classification",
+      "is_card_eligible",
+      "original_move_classification",
+      "original_is_card_eligible",
+      "move_contribution_total",
+      "body_adjusted_contribution_surplus",
+      "evidence_tier",
+      "move_card_note",
+      "move_eligibility_source"
+    )
+
+  move_eligibility_rows <- body_adjusted_move_eligibility
+} else {
+  move_eligibility_rows <- player_card_moves %>%
+    dplyr::mutate(
+      original_move_classification = .data$move_classification,
+      original_is_card_eligible = .data$is_card_eligible,
+      body_adjusted_contribution_surplus = NA_real_,
+      move_eligibility_source = "phase16c_player_card_moves"
+    )
+}
+
+eligible_moves <- move_eligibility_rows %>%
   dplyr::filter(dplyr::coalesce(.data$is_card_eligible, FALSE), !is.na(.data$move_name)) %>%
   dplyr::arrange(.data$player_id, dplyr::desc(.data$move_contribution_total), .data$move_name)
 
@@ -218,28 +310,40 @@ moves_summary <- eligible_moves %>%
   dplyr::group_by(.data$player_id) %>%
   dplyr::summarise(
     player_name_moves = first_non_missing(.data$player_name),
+    move_eligibility_source = first_non_missing(.data$move_eligibility_source),
     eligible_offensive_moves = collapse_move_rows(
       .data$move_name,
       .data$evidence_tier,
       .data$move_contribution_total,
       max_items = 8
     ),
+    body_adjusted_eligible_offensive_moves = dplyr::if_else(
+      first_non_missing(.data$move_eligibility_source) == "phase32_body_adjusted_move_eligibility",
+      collapse_move_rows(
+        .data$move_name,
+        .data$evidence_tier,
+        .data$move_contribution_total,
+        .data$body_adjusted_contribution_surplus,
+        max_items = 8
+      ),
+      NA_character_
+    ),
     signature_moves = collapse_move_rows(
-      .data$move_name[.data$move_classification == "PROVISIONAL_SIGNATURE"],
-      .data$evidence_tier[.data$move_classification == "PROVISIONAL_SIGNATURE"],
-      .data$move_contribution_total[.data$move_classification == "PROVISIONAL_SIGNATURE"],
+      .data$move_name[.data$move_classification %in% c("PROVISIONAL_SIGNATURE", "PROVISIONAL_BODY_ADJUSTED_SIGNATURE")],
+      .data$evidence_tier[.data$move_classification %in% c("PROVISIONAL_SIGNATURE", "PROVISIONAL_BODY_ADJUSTED_SIGNATURE")],
+      .data$move_contribution_total[.data$move_classification %in% c("PROVISIONAL_SIGNATURE", "PROVISIONAL_BODY_ADJUSTED_SIGNATURE")],
       max_items = 3
     ),
     core_moves = collapse_move_rows(
-      .data$move_name[.data$move_classification == "PROVISIONAL_CORE"],
-      .data$evidence_tier[.data$move_classification == "PROVISIONAL_CORE"],
-      .data$move_contribution_total[.data$move_classification == "PROVISIONAL_CORE"],
+      .data$move_name[.data$move_classification %in% c("PROVISIONAL_CORE", "PROVISIONAL_BODY_ADJUSTED_CORE")],
+      .data$evidence_tier[.data$move_classification %in% c("PROVISIONAL_CORE", "PROVISIONAL_BODY_ADJUSTED_CORE")],
+      .data$move_contribution_total[.data$move_classification %in% c("PROVISIONAL_CORE", "PROVISIONAL_BODY_ADJUSTED_CORE")],
       max_items = 5
     ),
     utility_moves = collapse_move_rows(
-      .data$move_name[.data$move_classification == "PROVISIONAL_UTILITY"],
-      .data$evidence_tier[.data$move_classification == "PROVISIONAL_UTILITY"],
-      .data$move_contribution_total[.data$move_classification == "PROVISIONAL_UTILITY"],
+      .data$move_name[.data$move_classification %in% c("PROVISIONAL_UTILITY", "PROVISIONAL_BODY_ADJUSTED_UTILITY")],
+      .data$evidence_tier[.data$move_classification %in% c("PROVISIONAL_UTILITY", "PROVISIONAL_BODY_ADJUSTED_UTILITY")],
+      .data$move_contribution_total[.data$move_classification %in% c("PROVISIONAL_UTILITY", "PROVISIONAL_BODY_ADJUSTED_UTILITY")],
       max_items = 6
     ),
     eligible_offensive_move_count = dplyr::n(),
@@ -333,6 +437,27 @@ top_body_adjusted_moves <- body_adjusted_signals %>%
   dplyr::slice_head(n = 5) %>%
   dplyr::summarise(
     top_body_adjusted_moves = collapse_move_rows(
+      .data$move_name,
+      .data$evidence_tier,
+      .data$move_contribution_total,
+      .data$body_adjusted_contribution_surplus,
+      max_items = 5
+    ),
+    .groups = "drop"
+  )
+
+diagnostic_body_adjusted_move_summary <- body_adjusted_signals %>%
+  dplyr::filter(
+    .data$signal_domain == "offensive_move",
+    !is.na(.data$move_name),
+    !is.na(.data$body_adjusted_contribution_surplus),
+    .data$body_adjusted_contribution_surplus > 0
+  ) %>%
+  dplyr::arrange(.data$player_id, dplyr::desc(.data$body_adjusted_contribution_surplus), .data$move_name) %>%
+  dplyr::group_by(.data$player_id) %>%
+  dplyr::summarise(
+    positive_diagnostic_body_adjusted_move_count = dplyr::n(),
+    diagnostic_body_adjusted_moves = collapse_move_rows(
       .data$move_name,
       .data$evidence_tier,
       .data$move_contribution_total,
@@ -458,6 +583,7 @@ possession_effects_refined <- safe_read_card_parquet(possession_effects_refined_
 card_universe <- dplyr::bind_rows(
   atk_v2_summary %>% dplyr::transmute(player_id = .data$player_id),
   player_card_moves %>% dplyr::filter(!is.na(.data$player_id)) %>% dplyr::transmute(player_id = .data$player_id),
+  move_eligibility_rows %>% dplyr::filter(!is.na(.data$player_id)) %>% dplyr::transmute(player_id = .data$player_id),
   body_adjusted_signals %>% dplyr::filter(!is.na(.data$player_id)) %>% dplyr::transmute(player_id = .data$player_id),
   possession_effects_refined %>% dplyr::transmute(player_id = .data$player_id),
   def_components %>% dplyr::transmute(player_id = .data$player_id),
@@ -469,8 +595,10 @@ card_universe <- dplyr::bind_rows(
 player_card_assembly_prototype <- card_universe %>%
   dplyr::left_join(atk_v2_summary, by = "player_id") %>%
   dplyr::left_join(moves_summary, by = "player_id") %>%
+  dplyr::left_join(original_eligible_moves_summary, by = "player_id") %>%
   dplyr::left_join(body_context, by = "player_id") %>%
   dplyr::left_join(top_body_adjusted_moves, by = "player_id") %>%
+  dplyr::left_join(diagnostic_body_adjusted_move_summary, by = "player_id") %>%
   dplyr::left_join(effects_summary, by = "player_id") %>%
   dplyr::left_join(top_body_adjusted_effects, by = "player_id") %>%
   dplyr::left_join(physical_attributes, by = "player_id", suffix = c("", "_phase27")) %>%
@@ -497,6 +625,29 @@ player_card_assembly_prototype <- card_universe %>%
     force_profile_confidence = dplyr::coalesce(.data$force_profile_confidence, .data$force_profile_confidence_phase27b),
     eligible_offensive_move_count = dplyr::coalesce(.data$eligible_offensive_move_count, 0L),
     eligible_effect_count = dplyr::coalesce(.data$eligible_effect_count, 0L),
+    original_eligible_offensive_move_count = dplyr::coalesce(.data$original_eligible_offensive_move_count, 0L),
+    positive_diagnostic_body_adjusted_move_count = dplyr::coalesce(.data$positive_diagnostic_body_adjusted_move_count, 0L),
+    move_eligibility_source = dplyr::coalesce(
+      .data$move_eligibility_source,
+      dplyr::if_else(
+        body_adjusted_move_eligibility_available,
+        "phase32_body_adjusted_move_eligibility",
+        "phase16c_player_card_moves"
+      )
+    ),
+    body_adjusted_eligible_offensive_moves = dplyr::if_else(
+      .data$move_eligibility_source == "phase32_body_adjusted_move_eligibility",
+      .data$body_adjusted_eligible_offensive_moves,
+      NA_character_
+    ),
+    insufficient_move_evidence_note = dplyr::case_when(
+      !is.na(.data$ATK_v2_score) &
+        .data$ATK_v2_score >= 70 &
+        .data$positive_diagnostic_body_adjusted_move_count > 0 &
+        .data$eligible_offensive_move_count == 0 ~
+        "High ATK / positive diagnostic body-adjusted move signal, but current evidence tier below card threshold.",
+      TRUE ~ NA_character_
+    ),
     is_normal_card = .data$eligible_offensive_move_count == 0 & .data$eligible_effect_count == 0,
     card_star_tier_placeholder = dplyr::case_when(
       is.na(.data$ATK_v2_score) ~ NA_character_,
@@ -530,17 +681,24 @@ player_card_assembly_prototype <- card_universe %>%
     "DEF_placeholder_score",
     "card_star_tier_placeholder",
     "is_normal_card",
+    "move_eligibility_source",
     "eligible_offensive_moves",
+    "original_eligible_offensive_moves",
+    "body_adjusted_eligible_offensive_moves",
     "signature_moves",
     "core_moves",
     "utility_moves",
     "top_body_adjusted_moves",
+    "insufficient_move_evidence_note",
     "eligible_effects",
     "top_body_adjusted_effects",
     "card_build_note",
     tidyselect::any_of(c(
       "eligible_offensive_move_count",
+      "original_eligible_offensive_move_count",
       "eligible_effect_count",
+      "positive_diagnostic_body_adjusted_move_count",
+      "diagnostic_body_adjusted_moves",
       "atk_v2_note",
       "atk_observed_data_scope_note",
       "body_signal_scope_note",
@@ -562,7 +720,7 @@ message("Number of normal cards: ", sum(player_card_assembly_prototype$is_normal
 message("Number with eligible offensive moves: ", sum(player_card_assembly_prototype$eligible_offensive_move_count > 0, na.rm = TRUE))
 message("Number with eligible effects: ", sum(player_card_assembly_prototype$eligible_effect_count > 0, na.rm = TRUE))
 
-requested_player_pattern <- "Luka Don|Doncic|Dončić|LeBron James|Austin Reaves|Deandre Ayton|DeAndre Ayton|Jaxson Hayes|Shai Gilgeous-Alexander|Trae Young|Jrue Holiday"
+requested_player_pattern <- "Luka Don|Doncic|Dončić|LeBron James|Austin Reaves|Deandre Ayton|DeAndre Ayton|Jaxson Hayes|Shai Gilgeous-Alexander|Keyonte George|Trae Young|Jrue Holiday"
 
 message("Requested prototype card examples:")
 print(
@@ -578,7 +736,11 @@ print(
       "DEF_placeholder_score",
       "card_star_tier_placeholder",
       "is_normal_card",
+      "move_eligibility_source",
       "eligible_offensive_moves",
+      "original_eligible_offensive_moves",
+      "body_adjusted_eligible_offensive_moves",
+      "insufficient_move_evidence_note",
       "eligible_effects",
       "top_body_adjusted_moves",
       "top_body_adjusted_effects"
@@ -598,7 +760,9 @@ print(
       "ATK_v2_raw",
       "ATK_v2_score",
       "card_star_tier_placeholder",
+      "move_eligibility_source",
       "eligible_offensive_move_count",
+      "original_eligible_offensive_move_count",
       "eligible_effect_count",
       "is_normal_card"
     ) %>%
